@@ -47,11 +47,11 @@
         <header class="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-800/50 pb-6">
             <div>
                 <h1 class="text-2xl font-semibold text-zinc-100">Yönetim Paneli</h1>
-                <p class="text-sm text-zinc-500 mt-1">Yerel depolama kullanan minimal takip aracı</p>
+                <p class="text-sm text-zinc-500 mt-1">Gerçek zamanlı bulut takip aracı</p>
             </div>
-            <div class="flex items-center gap-2 text-xs font-medium bg-zinc-900/50 px-3 py-1.5 rounded-full border border-zinc-800/50 w-fit">
-                <i data-lucide="hard-drive" class="w-4 h-4 text-zinc-400"></i>
-                Yerel Kayıt Aktif
+            <div id="sync-status" class="flex items-center gap-2 text-xs font-medium bg-zinc-900/50 px-3 py-1.5 rounded-full border border-zinc-800/50 w-fit transition-colors">
+                <i data-lucide="loader-2" class="w-4 h-4 text-zinc-400 animate-spin"></i>
+                Bağlanıyor...
             </div>
         </header>
 
@@ -158,10 +158,25 @@
     </div>
 
     <!-- Application Logic -->
-    <script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase Configuration (Platform Environment)
+        const firebaseConfig = typeof __firebase_config !== 'undefined' 
+            ? JSON.parse(__firebase_config) 
+            : { projectId: "demo-project" }; // Sadece test/önizleme için
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'minimal-collab-dashboard';
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
         // --- State Management ---
-        let tasks = JSON.parse(localStorage.getItem('minimal-tasks')) || [];
-        let transactions = JSON.parse(localStorage.getItem('minimal-transactions')) || [];
+        let user = null;
+        let tasks = [];
+        let transactions = [];
         let currentTxType = 'expense'; // default
 
         // --- DOM Elements ---
@@ -178,21 +193,56 @@
         const typeIncomeBtn = document.getElementById('type-income');
         const typeExpenseBtn = document.getElementById('type-expense');
         const totalBalanceEl = document.getElementById('total-balance');
+        const syncStatusEl = document.getElementById('sync-status');
 
-        // --- Utilities ---
-        const generateId = () => Math.random().toString(36).substr(2, 9);
-        const saveTasks = () => localStorage.setItem('minimal-tasks', JSON.stringify(tasks));
-        const saveTransactions = () => localStorage.setItem('minimal-transactions', JSON.stringify(transactions));
+        // --- Init Auth & Database ---
+        async function initApp() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Auth failed:", err);
+            }
+        }
+
+        onAuthStateChanged(auth, (currentUser) => {
+            if (currentUser) {
+                user = currentUser;
+                syncStatusEl.innerHTML = `<i data-lucide="cloud-lightning" class="w-4 h-4 text-emerald-400"></i> Bulut Senkronize`;
+                syncStatusEl.classList.add('border-emerald-500/30', 'bg-emerald-500/10');
+                lucide.createIcons();
+                setupRealtimeListeners();
+            }
+        });
+
+        initApp();
+
+        function setupRealtimeListeners() {
+            const tasksRef = collection(db, 'artifacts', appId, 'public', 'data', 'tasks');
+            const txRef = collection(db, 'artifacts', appId, 'public', 'data', 'transactions');
+
+            onSnapshot(tasksRef, (snapshot) => {
+                tasks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderTasks();
+            }, (error) => console.error("Tasks error:", error));
+
+            onSnapshot(txRef, (snapshot) => {
+                transactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderTransactions();
+            }, (error) => console.error("Transactions error:", error));
+        }
 
         // --- Tasks Logic ---
         function renderTasks() {
             if (tasks.length === 0) {
                 taskList.innerHTML = `<div class="h-full flex flex-col items-center justify-center text-zinc-600 text-sm">Görev listesi boş.</div>`;
-                lucide.createIcons();
                 return;
             }
 
-            // Sort tasks: uncompleted first, then by creation date (newest first)
+            // Hafızada sıralama (Firestore karmaşık sorgu kuralları gereği)
             const sortedTasks = [...tasks].sort((a, b) => {
                 if (a.completed === b.completed) return b.createdAt - a.createdAt;
                 return a.completed ? 1 : -1;
@@ -200,7 +250,7 @@
 
             taskList.innerHTML = sortedTasks.map(task => `
                 <div class="group flex items-center justify-between p-3 rounded-xl hover:bg-zinc-900/50 border border-transparent hover:border-zinc-800/50 transition-all">
-                    <div class="flex items-center gap-3 cursor-pointer flex-1" onclick="toggleTask('${task.id}')">
+                    <div class="flex items-center gap-3 cursor-pointer flex-1" onclick="toggleTask('${task.id}', ${task.completed})">
                         <button class="text-zinc-500 hover:text-zinc-300 transition-colors flex-shrink-0">
                             ${task.completed 
                                 ? `<i data-lucide="check-circle-2" class="w-5 h-5 text-emerald-500"></i>` 
@@ -222,37 +272,39 @@
             taskSubmitBtn.disabled = !e.target.value.trim();
         });
 
-        taskForm.addEventListener('submit', (e) => {
+        taskForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const text = taskInput.value.trim();
-            if (!text) return;
-
-            tasks.push({
-                id: generateId(),
-                text,
-                completed: false,
-                createdAt: Date.now()
-            });
-
-            saveTasks();
-            renderTasks();
+            if (!text || !user) return;
+            
             taskInput.value = '';
             taskSubmitBtn.disabled = true;
+
+            try {
+                const tasksRef = collection(db, 'artifacts', appId, 'public', 'data', 'tasks');
+                await addDoc(tasksRef, {
+                    text,
+                    completed: false,
+                    createdAt: Date.now(),
+                    createdBy: user.uid
+                });
+            } catch (err) { console.error(err); }
         });
 
-        window.toggleTask = (id) => {
-            const task = tasks.find(t => t.id === id);
-            if (task) {
-                task.completed = !task.completed;
-                saveTasks();
-                renderTasks();
-            }
+        window.toggleTask = async (id, currentStatus) => {
+            if (!user) return;
+            try {
+                const taskDoc = doc(db, 'artifacts', appId, 'public', 'data', 'tasks', id);
+                await updateDoc(taskDoc, { completed: !currentStatus });
+            } catch (err) { console.error(err); }
         };
 
-        window.deleteTask = (id) => {
-            tasks = tasks.filter(t => t.id !== id);
-            saveTasks();
-            renderTasks();
+        window.deleteTask = async (id) => {
+            if (!user) return;
+            try {
+                const taskDoc = doc(db, 'artifacts', appId, 'public', 'data', 'tasks', id);
+                await deleteDoc(taskDoc);
+            } catch (err) { console.error(err); }
         };
 
         // --- Finances Logic ---
@@ -288,7 +340,6 @@
             // Render List
             if (transactions.length === 0) {
                 txList.innerHTML = `<div class="h-full flex flex-col items-center justify-center text-zinc-600 text-sm">Henüz işlem eklenmedi.</div>`;
-                lucide.createIcons();
                 return;
             }
 
@@ -316,41 +367,42 @@
             lucide.createIcons();
         }
 
-        txForm.addEventListener('submit', (e) => {
+        txForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const desc = txDesc.value.trim();
             const amount = parseFloat(txAmount.value);
 
-            if (!desc || isNaN(amount) || amount <= 0) return;
-
-            transactions.push({
-                id: generateId(),
-                description: desc,
-                amount: amount,
-                type: currentTxType,
-                createdAt: Date.now()
-            });
-
-            saveTransactions();
-            renderTransactions();
+            if (!desc || isNaN(amount) || amount <= 0 || !user) return;
             
             txDesc.value = '';
             txAmount.value = '';
             validateTxForm();
+
+            try {
+                const txRef = collection(db, 'artifacts', appId, 'public', 'data', 'transactions');
+                await addDoc(txRef, {
+                    description: desc,
+                    amount: amount,
+                    type: currentTxType,
+                    createdAt: Date.now(),
+                    createdBy: user.uid
+                });
+            } catch(err) { console.error(err); }
         });
 
-        window.deleteTransaction = (id) => {
-            transactions = transactions.filter(t => t.id !== id);
-            saveTransactions();
-            renderTransactions();
+        window.deleteTransaction = async (id) => {
+            if (!user) return;
+            try {
+                const txDoc = doc(db, 'artifacts', appId, 'public', 'data', 'transactions', id);
+                await deleteDoc(txDoc);
+            } catch(err) { console.error(err); }
         };
 
-        // --- Initialize ---
+        // --- Initialize UI ---
         lucide.createIcons();
+        updateTxTypeUI();
         renderTasks();
         renderTransactions();
-        updateTxTypeUI();
-
     </script>
 </body>
 </html>
