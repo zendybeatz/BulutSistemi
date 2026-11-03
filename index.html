@@ -8,6 +8,8 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Gun.js for Accountless P2P Sync -->
+    <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
         
@@ -47,11 +49,18 @@
         <header class="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-800/50 pb-6">
             <div>
                 <h1 class="text-2xl font-semibold text-zinc-100">Yönetim Paneli</h1>
-                <p class="text-sm text-zinc-500 mt-1">Gerçek zamanlı bulut takip aracı</p>
+                <p class="text-sm text-zinc-500 mt-1">Hesapsız P2P Ortak Alan</p>
             </div>
-            <div id="sync-status" class="flex items-center gap-2 text-xs font-medium bg-zinc-900/50 px-3 py-1.5 rounded-full border border-zinc-800/50 w-fit transition-colors">
-                <i data-lucide="loader-2" class="w-4 h-4 text-zinc-400 animate-spin"></i>
-                Bağlanıyor...
+            <div class="flex items-center gap-2 bg-zinc-900/50 p-2 rounded-xl border border-zinc-800/50 w-full md:w-auto">
+                <div class="flex items-center gap-2 px-2 border-r border-zinc-800/50">
+                    <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+                    <span class="text-xs text-zinc-400 font-medium">Yayında</span>
+                </div>
+                <span class="text-xs text-zinc-500 pl-2">Oda Linki:</span>
+                <input type="text" id="invite-link" readonly class="bg-transparent text-xs text-emerald-400 focus:outline-none w-32 md:w-48 truncate" />
+                <button id="copy-btn" onclick="copyInviteLink()" class="text-zinc-400 hover:text-zinc-100 p-1 transition-colors" title="Linki Kopyala">
+                    <i data-lucide="copy" class="w-4 h-4"></i>
+                </button>
             </div>
         </header>
 
@@ -179,26 +188,48 @@
     </div>
 
     <!-- Application Logic -->
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+    <script>
+        // --- Room Management ---
+        const urlParams = new URLSearchParams(window.location.search);
+        let roomId = urlParams.get('room');
+        if (!roomId) {
+            // Generate a random room ID if not present
+            roomId = Math.random().toString(36).substring(2, 15);
+            const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname + '?room=' + roomId;
+            window.history.replaceState({path: newUrl}, '', newUrl);
+        }
 
-        // Firebase Configuration (Platform Environment)
-        const firebaseConfig = typeof __firebase_config !== 'undefined' 
-            ? JSON.parse(__firebase_config) 
-            : { projectId: "demo-project" }; // Sadece test/önizleme için
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'minimal-collab-dashboard';
+        const inviteLinkInput = document.getElementById('invite-link');
+        inviteLinkInput.value = window.location.href;
 
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
+        window.copyInviteLink = () => {
+            inviteLinkInput.select();
+            document.execCommand('copy');
+            
+            const btn = document.getElementById('copy-btn');
+            btn.innerHTML = `<i data-lucide="check" class="w-4 h-4 text-emerald-500"></i>`;
+            lucide.createIcons();
+            setTimeout(() => {
+                btn.innerHTML = `<i data-lucide="copy" class="w-4 h-4"></i>`;
+                lucide.createIcons();
+            }, 2000);
+        };
+
+        // --- Init Decentralized DB (Gun.js) ---
+        // We use public community relays. No accounts, no API keys required!
+        const gun = Gun([
+            'https://gun-manhattan.herokuapp.com/gun',
+            'https://relay.peer.ooo/gun'
+        ]);
+
+        const db = gun.get('minimal-panel-v1-' + roomId);
+        const tasksDb = db.get('tasks');
+        const txDb = db.get('transactions');
 
         // --- State Management ---
-        let user = null;
-        let tasks = [];
-        let transactions = [];
-        let currentTxType = 'income'; // default changed to income
+        let tasks = {};
+        let transactions = {};
+        let currentTxType = 'income';
 
         // --- DOM Elements ---
         const taskInput = document.getElementById('task-input');
@@ -217,57 +248,36 @@
         const totalBalanceEl = document.getElementById('total-balance');
         const totalIncomeEl = document.getElementById('total-income');
         const totalExpenseEl = document.getElementById('total-expense');
-        const syncStatusEl = document.getElementById('sync-status');
 
-        // --- Init Auth & Database ---
-        async function initApp() {
-            try {
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    await signInWithCustomToken(auth, __initial_auth_token);
-                } else {
-                    await signInAnonymously(auth);
-                }
-            } catch (err) {
-                console.error("Auth failed:", err);
+        // --- Realtime Listeners ---
+        tasksDb.map().on((data, id) => {
+            if (data === null) {
+                delete tasks[id];
+            } else {
+                tasks[id] = { id, ...data };
             }
-        }
-
-        onAuthStateChanged(auth, (currentUser) => {
-            if (currentUser) {
-                user = currentUser;
-                syncStatusEl.innerHTML = `<i data-lucide="cloud-lightning" class="w-4 h-4 text-emerald-400"></i> Bulut Senkronize`;
-                syncStatusEl.classList.add('border-emerald-500/30', 'bg-emerald-500/10');
-                lucide.createIcons();
-                setupRealtimeListeners();
-            }
+            renderTasks();
         });
 
-        initApp();
-
-        function setupRealtimeListeners() {
-            const tasksRef = collection(db, 'artifacts', appId, 'public', 'data', 'tasks');
-            const txRef = collection(db, 'artifacts', appId, 'public', 'data', 'transactions');
-
-            onSnapshot(tasksRef, (snapshot) => {
-                tasks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                renderTasks();
-            }, (error) => console.error("Tasks error:", error));
-
-            onSnapshot(txRef, (snapshot) => {
-                transactions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                renderTransactions();
-            }, (error) => console.error("Transactions error:", error));
-        }
+        txDb.map().on((data, id) => {
+            if (data === null) {
+                delete transactions[id];
+            } else {
+                transactions[id] = { id, ...data };
+            }
+            renderTransactions();
+        });
 
         // --- Tasks Logic ---
         function renderTasks() {
-            if (tasks.length === 0) {
+            const tasksArray = Object.values(tasks).filter(t => t && t.createdAt);
+            
+            if (tasksArray.length === 0) {
                 taskList.innerHTML = `<div class="h-full flex flex-col items-center justify-center text-zinc-600 text-sm">Görev listesi boş.</div>`;
                 return;
             }
 
-            // Hafızada sıralama (Firestore karmaşık sorgu kuralları gereği)
-            const sortedTasks = [...tasks].sort((a, b) => {
+            const sortedTasks = tasksArray.sort((a, b) => {
                 if (a.completed === b.completed) return b.createdAt - a.createdAt;
                 return a.completed ? 1 : -1;
             });
@@ -296,39 +306,28 @@
             taskSubmitBtn.disabled = !e.target.value.trim();
         });
 
-        taskForm.addEventListener('submit', async (e) => {
+        taskForm.addEventListener('submit', (e) => {
             e.preventDefault();
             const text = taskInput.value.trim();
-            if (!text || !user) return;
+            if (!text) return;
             
             taskInput.value = '';
             taskSubmitBtn.disabled = true;
 
-            try {
-                const tasksRef = collection(db, 'artifacts', appId, 'public', 'data', 'tasks');
-                await addDoc(tasksRef, {
-                    text,
-                    completed: false,
-                    createdAt: Date.now(),
-                    createdBy: user.uid
-                });
-            } catch (err) { console.error(err); }
+            const id = Gun.text.random();
+            tasksDb.get(id).put({
+                text: text,
+                completed: false,
+                createdAt: Date.now()
+            });
         });
 
-        window.toggleTask = async (id, currentStatus) => {
-            if (!user) return;
-            try {
-                const taskDoc = doc(db, 'artifacts', appId, 'public', 'data', 'tasks', id);
-                await updateDoc(taskDoc, { completed: !currentStatus });
-            } catch (err) { console.error(err); }
+        window.toggleTask = (id, currentStatus) => {
+            tasksDb.get(id).get('completed').put(!currentStatus);
         };
 
-        window.deleteTask = async (id) => {
-            if (!user) return;
-            try {
-                const taskDoc = doc(db, 'artifacts', appId, 'public', 'data', 'tasks', id);
-                await deleteDoc(taskDoc);
-            } catch (err) { console.error(err); }
+        window.deleteTask = (id) => {
+            tasksDb.get(id).put(null);
         };
 
         // --- Finances Logic ---
@@ -354,31 +353,30 @@
         txAmount.addEventListener('input', validateTxForm);
 
         function renderTransactions() {
-            // Calculate Totals
+            const txArray = Object.values(transactions).filter(t => t && t.createdAt);
+
             let tIncome = 0;
             let tExpense = 0;
             
-            transactions.forEach(tx => {
-                if (tx.type === 'income') tIncome += tx.amount;
-                else tExpense += tx.amount;
+            txArray.forEach(tx => {
+                if (tx.type === 'income') tIncome += parseFloat(tx.amount);
+                else tExpense += parseFloat(tx.amount);
             });
 
             const netTotal = tIncome - tExpense;
 
-            // Update UI Totals
             totalBalanceEl.textContent = `Net: ${netTotal >= 0 ? '+' : ''}${netTotal.toLocaleString('tr-TR', {minimumFractionDigits: 2, maximumFractionDigits:2})} ₺`;
             totalBalanceEl.className = `text-lg font-medium ${netTotal >= 0 ? 'text-emerald-400' : 'text-zinc-400'}`;
             
             totalIncomeEl.textContent = `${tIncome.toLocaleString('tr-TR', {minimumFractionDigits: 2, maximumFractionDigits:2})} ₺`;
             totalExpenseEl.textContent = `${tExpense.toLocaleString('tr-TR', {minimumFractionDigits: 2, maximumFractionDigits:2})} ₺`;
 
-            // Render List
-            if (transactions.length === 0) {
+            if (txArray.length === 0) {
                 txList.innerHTML = `<div class="h-full flex flex-col items-center justify-center text-zinc-600 text-sm">Henüz işlem eklenmedi.</div>`;
                 return;
             }
 
-            const sortedTx = [...transactions].sort((a, b) => b.createdAt - a.createdAt);
+            const sortedTx = txArray.sort((a, b) => b.createdAt - a.createdAt);
 
             txList.innerHTML = sortedTx.map(tx => `
                 <div class="group flex items-center justify-between p-3 rounded-xl hover:bg-zinc-900/50 border border-transparent hover:border-zinc-800/50 transition-all">
@@ -394,7 +392,7 @@
                     
                     <div class="flex items-center gap-3 pl-2 flex-shrink-0">
                         <span class="text-sm font-medium ${tx.type === 'income' ? 'text-emerald-400' : 'text-zinc-400'}">
-                            ${tx.type === 'income' ? '+' : '-'}${tx.amount.toLocaleString('tr-TR', {minimumFractionDigits: 2, maximumFractionDigits:2})} ₺
+                            ${tx.type === 'income' ? '+' : '-'}${parseFloat(tx.amount).toLocaleString('tr-TR', {minimumFractionDigits: 2, maximumFractionDigits:2})} ₺
                         </span>
                         <button onclick="deleteTransaction('${tx.id}')" class="text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all p-1">
                             <i data-lucide="trash-2" class="w-4 h-4"></i>
@@ -405,39 +403,31 @@
             lucide.createIcons();
         }
 
-        txForm.addEventListener('submit', async (e) => {
+        txForm.addEventListener('submit', (e) => {
             e.preventDefault();
             const business = txBusiness.value.trim();
             const desc = txDesc.value.trim();
             const amount = parseFloat(txAmount.value);
 
-            if (!business || isNaN(amount) || amount <= 0 || !user) return;
+            if (!business || isNaN(amount) || amount <= 0) return;
             
-            // Sadece başarılı eklemeden sonra inputları temizle
             txBusiness.value = '';
             txDesc.value = '';
             txAmount.value = '';
             validateTxForm();
 
-            try {
-                const txRef = collection(db, 'artifacts', appId, 'public', 'data', 'transactions');
-                await addDoc(txRef, {
-                    businessName: business,
-                    description: desc,
-                    amount: amount,
-                    type: currentTxType,
-                    createdAt: Date.now(),
-                    createdBy: user.uid
-                });
-            } catch(err) { console.error(err); }
+            const id = Gun.text.random();
+            txDb.get(id).put({
+                businessName: business,
+                description: desc,
+                amount: amount,
+                type: currentTxType,
+                createdAt: Date.now()
+            });
         });
 
-        window.deleteTransaction = async (id) => {
-            if (!user) return;
-            try {
-                const txDoc = doc(db, 'artifacts', appId, 'public', 'data', 'transactions', id);
-                await deleteDoc(txDoc);
-            } catch(err) { console.error(err); }
+        window.deleteTransaction = (id) => {
+            txDb.get(id).put(null);
         };
 
         // --- Initialize UI ---
